@@ -13,6 +13,7 @@ from werkzeug.datastructures import MIMEAccept
 from werkzeug.datastructures import MultiDict
 from werkzeug.datastructures import WWWAuthenticate
 from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import ParameterSourceConflict
 from werkzeug.exceptions import SecurityError
 from werkzeug.exceptions import UnsupportedMediaType
 from werkzeug.http import COEP
@@ -495,6 +496,253 @@ def test_get_data_method_parsing_caching_behavior():
     )
     assert req.get_data(parse_form_data=True) == b""
     assert req.form["foo"] == "Hello World"
+
+
+class SourceContractRequest(wrappers.Request):
+    parameter_source_contract = {
+        "approve": "form",
+        "next": "query",
+        "token": "unique",
+    }
+
+
+def _contract_request(path="/", **kwargs):
+    kwargs.setdefault("method", "POST")
+    if kwargs["method"] != "GET":
+        kwargs.setdefault("content_type", "application/x-www-form-urlencoded")
+    return SourceContractRequest.from_values(path, **kwargs)
+
+
+def test_parameter_source_contract_form_only_in_query():
+    req = _contract_request("/?approve=secret-value", data="other=1")
+
+    with pytest.raises(ParameterSourceConflict) as exc_info:
+        _ = req.args
+
+    e = exc_info.value
+    assert isinstance(e, BadRequest)
+    assert e.parameter == "approve"
+    assert e.rule == "form"
+    assert e.sources == ("query string",)
+    # the description identifies the field and sources, never the value
+    assert "'approve'" in e.description
+    assert "query string" in e.description
+    assert "form body" in e.description
+    assert "secret-value" not in e.description
+
+
+def test_parameter_source_contract_query_only_in_form():
+    req = _contract_request(data="next=/other")
+
+    with pytest.raises(ParameterSourceConflict) as exc_info:
+        _ = req.form
+
+    e = exc_info.value
+    assert e.parameter == "next"
+    assert e.rule == "query"
+    assert e.sources == ("form body",)
+    assert "/other" not in e.description
+
+
+def test_parameter_source_contract_same_value_still_conflicts():
+    # identical values in both channels are still a conflict
+    req = _contract_request("/?approve=1", data="approve=1")
+
+    with pytest.raises(ParameterSourceConflict) as exc_info:
+        _ = req.values
+
+    assert exc_info.value.sources == ("query string", "form body")
+
+
+def test_parameter_source_contract_decoded_names():
+    # percent-encoding differences don't hide a parameter, the decoded
+    # name is compared
+    req = _contract_request("/?%61pprove=1", data="")
+
+    with pytest.raises(ParameterSourceConflict) as exc_info:
+        _ = req.args
+
+    assert exc_info.value.parameter == "approve"
+
+    req = _contract_request(data="%6eext=1")
+
+    with pytest.raises(ParameterSourceConflict) as exc_info:
+        _ = req.form
+
+    assert exc_info.value.parameter == "next"
+
+
+def test_parameter_source_contract_unique():
+    # sent twice in the query string
+    req = _contract_request("/?token=a&token=b", method="GET")
+
+    with pytest.raises(ParameterSourceConflict) as exc_info:
+        _ = req.args
+
+    assert exc_info.value.parameter == "token"
+    assert exc_info.value.rule == "unique"
+
+    # sent once in each channel
+    req = _contract_request("/?token=a", data="token=b")
+
+    with pytest.raises(ParameterSourceConflict):
+        _ = req.values
+
+    # sent exactly once is allowed, absent is allowed
+    req = _contract_request("/?token=a&next=/home", method="GET")
+    assert req.args["token"] == "a"
+    req = _contract_request("/", method="GET")
+    assert "token" not in req.args
+
+
+def test_parameter_source_contract_multivalue_allowed():
+    # unlisted multi-value parameters are unaffected
+    req = _contract_request("/?tags=a&tags=b", data="tags=c&other=1")
+    assert req.values.getlist("tags") == ["a", "b", "c"]
+    assert req.values["other"] == "1"
+
+
+def test_parameter_source_contract_unknown_fields_unaffected():
+    # the contract does not expand to unlisted fields
+    req = _contract_request("/?other=a", data="other=b")
+    assert req.values.getlist("other") == ["a", "b"]
+
+
+def test_parameter_source_contract_consistent_access_order():
+    # args, form, values, and get_data all reach the same conclusion,
+    # regardless of the order they are accessed in
+    req = _contract_request("/?approve=1", data="other=1")
+
+    accesses = (lambda: req.args, lambda: req.form, lambda: req.values, req.get_data)
+
+    for access in accesses:
+        with pytest.raises(ParameterSourceConflict):
+            access()
+
+    # a clean request allows every access order too
+    for first in ("args", "form", "values", "get_data"):
+        req = _contract_request("/?next=/home", data="approve=1")
+        getattr(req, first) if first != "get_data" else req.get_data()
+        assert req.args["next"] == "/home"
+        assert req.form["approve"] == "1"
+
+
+def test_parameter_source_contract_get_request():
+    # a form-only parameter in the query string conflicts even though
+    # GET values don't include the form
+    req = _contract_request("/?approve=1", method="GET")
+
+    with pytest.raises(ParameterSourceConflict):
+        _ = req.values
+
+
+def test_parameter_source_contract_multipart_closes_files():
+    captured = {}
+
+    class CaptureRequest(SourceContractRequest):
+        def _parse_form_data(self, stream):
+            result = super()._parse_form_data(stream)
+
+            if result is not None:
+                captured["files"] = result[1]
+
+            return result
+
+    req = CaptureRequest.from_values(
+        "/?approve=1",
+        method="POST",
+        data={"upload": (BytesIO(b"file-content"), "test.txt"), "other": "x"},
+        content_type="multipart/form-data",
+    )
+
+    with pytest.raises(ParameterSourceConflict):
+        _ = req.form
+
+    # upload streams created while parsing are closed on rejection
+    assert captured["files"]["upload"].stream.closed
+
+    # the rejection is cached, further access raises again instead of
+    # returning a value cached while checking
+    for access in (lambda: req.args, lambda: req.form, lambda: req.values):
+        with pytest.raises(ParameterSourceConflict):
+            access()
+
+
+def test_parameter_source_contract_multipart_allowed():
+    req = SourceContractRequest.from_values(
+        "/?next=/home",
+        method="POST",
+        data={"approve": "1", "tags": ["a", "b"]},
+        content_type="multipart/form-data",
+    )
+    assert req.form["approve"] == "1"
+    assert req.form.getlist("tags") == ["a", "b"]
+
+
+def test_parameter_source_contract_file_not_text_value():
+    # a file upload is never merged with a same-named text field
+    body = (
+        b'--foo\r\nContent-Disposition: form-data; name="approve"\r\n\r\nyes\r\n'
+        b'--foo\r\nContent-Disposition: form-data; name="approve";'
+        b' filename="a.txt"\r\nContent-Type: text/plain\r\n\r\nfile-content\r\n'
+        b"--foo--\r\n"
+    )
+
+    with SourceContractRequest.from_values(
+        method="POST", data=body, content_type="multipart/form-data; boundary=foo"
+    ) as req:
+        assert req.form["approve"] == "yes"
+        assert req.files["approve"].filename == "a.txt"
+
+    # a file alone does not satisfy or violate a form rule
+    body = (
+        b'--foo\r\nContent-Disposition: form-data; name="approve";'
+        b' filename="a.txt"\r\nContent-Type: text/plain\r\n\r\nfile-content\r\n'
+        b"--foo--\r\n"
+    )
+
+    with SourceContractRequest.from_values(
+        method="POST", data=body, content_type="multipart/form-data; boundary=foo"
+    ) as req:
+        assert "approve" not in req.form
+        assert req.files["approve"].filename == "a.txt"
+
+
+def test_parameter_source_contract_malformed_body():
+    # a multipart content type without a boundary parses to an empty
+    # form, the contract still applies to the query string
+    req = SourceContractRequest.from_values(
+        "/?approve=1",
+        method="POST",
+        data=(
+            b"--foo\r\nContent-Disposition: form-data; name=approve\r\n\r\n1\r\n"
+            b"--foo--"
+        ),
+        content_type="multipart/form-data",
+    )
+
+    with pytest.raises(ParameterSourceConflict):
+        _ = req.values
+
+    # a truncated multipart body parses to an empty form without
+    # crashing or masking the contract
+    req = SourceContractRequest.from_values(
+        method="POST",
+        data=b"--foo\r\nContent-Disposition: form-data; name=approve\r\n\r\n1",
+        content_type="multipart/form-data; boundary=foo",
+    )
+    assert req.form == {}
+    assert not req.files
+
+
+def test_parameter_source_contract_invalid_rule():
+    class BadContractRequest(wrappers.Request):
+        parameter_source_contract = {"approve": "header"}
+
+    req = BadContractRequest.from_values("/?approve=1")
+
+    with pytest.raises(ValueError, match="Unknown parameter source rule"):
+        _ = req.args
 
 
 def test_authenticate():

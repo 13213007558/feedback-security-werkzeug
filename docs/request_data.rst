@@ -67,6 +67,45 @@ based on how the WSGI/HTTP server and client handle connections, it's not
 something the WSGI application (Werkzeug) has control over.
 
 
+Restricting Parameter Sources
+-----------------------------
+
+:attr:`.Request.values` combines the query string and form body, which is
+convenient but means a parameter such as ``approve`` could be sent through
+either channel. For security-sensitive parameters, the application can declare
+a contract restricting which source each parameter may be sent in by setting
+:attr:`~.Request.parameter_source_contract` on a :class:`.Request` subclass.
+
+.. code-block:: python
+
+    from werkzeug import Request
+
+    class MyRequest(Request):
+        parameter_source_contract = {
+            "approve": "form",  # only in the form body
+            "next": "query",  # only in the query string
+            "token": "unique",  # at most once across both
+        }
+
+If a restricted parameter is sent from a disallowed source, or a ``"unique"``
+parameter is sent more than once, accessing :attr:`~.Request.args`,
+:attr:`~.Request.form`, :attr:`~.Request.files`, :attr:`~.Request.values`, or
+:meth:`~.Request.get_data` raises
+:exc:`~werkzeug.exceptions.ParameterSourceConflict`, a 400 error. The check is
+performed once per request and cached, so every access order produces the same
+result, and any file uploads that were parsed are closed. Names are compared
+after decoding, so percent-encoding differences such as ``%61pprove`` do not
+bypass the check.
+
+Parameters not listed in the contract are not affected, and may still be sent
+multiple times from any source. File uploads are kept in
+:attr:`~.Request.files` and are never treated as form text values. The
+contract only validates, it does not modify :attr:`~.Request.args` or
+:attr:`~.Request.form`.
+
+.. versionadded:: 3.2
+
+
 WSGI Server Input Termination
 -----------------------------
 

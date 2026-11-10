@@ -16,6 +16,7 @@ from ..datastructures.structures import ImmutableMultiDict
 from ..datastructures.structures import iter_multi_items
 from ..datastructures.structures import MultiDict
 from ..exceptions import BadRequest
+from ..exceptions import ParameterSourceConflict
 from ..exceptions import RequestEntityTooLarge
 from ..exceptions import UnsupportedMediaType
 from ..formparser import _FormDataParser
@@ -109,6 +110,33 @@ class Request(_SansIORequest):
     :attr:`max_content_length`.
 
     .. versionadded:: 2.2.3
+    """
+
+    parameter_source_contract: dict[str, str] = {}
+    """Restrict which source channels named parameters may be sent in. This
+    maps a decoded parameter name to a rule:
+
+    -   ``"query"``: The parameter may only be sent in the query string.
+    -   ``"form"``: The parameter may only be sent in the form body.
+    -   ``"unique"``: The parameter may be sent at most once across the
+        query string and form body combined.
+
+    If a restricted parameter is found in a disallowed source, or a
+    ``"unique"`` parameter is sent more than once, accessing :attr:`args`,
+    :attr:`form`, :attr:`files`, :attr:`values`, or :meth:`get_data` raises
+    :exc:`~werkzeug.exceptions.ParameterSourceConflict`. The check is
+    performed once and cached, so every access order produces the same
+    result. Enabling the check may cause the request body to be parsed
+    earlier than it otherwise would be.
+
+    Names are compared after decoding, so percent-encoding differences do
+    not matter. Parameters not listed here are not affected and may still
+    be sent multiple times from any source. File uploads are kept in
+    :attr:`files` and are never treated as form text values. The original
+    :attr:`args` and :attr:`form` data is not modified. The default empty
+    dict disables the check.
+
+    .. versionadded:: 3.2
     """
 
     form_data_parser_class: None = None
@@ -453,6 +481,89 @@ class Request(_SansIORequest):
             else:
                 self.form, self.files = result  # type: ignore[assignment]
 
+    def _check_parameter_source_contract(self) -> None:
+        """Validate the request against :attr:`parameter_source_contract`,
+        raising :exc:`~werkzeug.exceptions.ParameterSourceConflict` if a
+        restricted parameter was sent from a disallowed source.
+
+        The result is computed once and cached, so every access point and
+        access order produces the same conclusion. If the request is
+        rejected, any upload streams created while parsing are closed.
+
+        :meta private:
+        """
+        contract = self.parameter_source_contract
+
+        if not contract or self.__dict__.get("_checking_source_contract"):
+            # No contract, or re-entrant access from within the check
+            # itself while it reads args and form.
+            return
+
+        if "_source_contract_error" not in self.__dict__:
+            self.__dict__["_checking_source_contract"] = True
+
+            try:
+                error = self._find_parameter_source_conflict(contract)
+            finally:
+                del self.__dict__["_checking_source_contract"]
+
+            self.__dict__["_source_contract_error"] = error
+
+            if error is not None:
+                # The request is rejected, don't leave upload streams open.
+                self.close()
+
+                # Discard data cached while checking, so that further
+                # access runs this check again and raises the cached error
+                # instead of returning a cached value.
+                for key in ("args", "form", "files", "values"):
+                    self.__dict__.pop(key, None)
+
+        error = self.__dict__["_source_contract_error"]
+
+        if error is not None:
+            raise error
+
+    def _find_parameter_source_conflict(
+        self, contract: dict[str, str]
+    ) -> ParameterSourceConflict | None:
+        """Check each contracted parameter against the decoded query string
+        and form field names. File uploads are not considered form values.
+
+        :meta private:
+        """
+        args = self.args
+
+        if self.shallow:
+            # The body can't be read, only the query string can be checked.
+            form: ImmutableMultiDict[str, str] = ImmutableMultiDict()
+        else:
+            form = self.form
+
+        for name, rule in contract.items():
+            sources = tuple(
+                source
+                for source, d in (("query string", args), ("form body", form))
+                if name in d
+            )
+
+            if rule == "query":
+                if name in form:
+                    return ParameterSourceConflict(name, rule, sources)
+            elif rule == "form":
+                if name in args:
+                    return ParameterSourceConflict(name, rule, sources)
+            elif rule == "unique":
+                if len(args.getlist(name)) + len(form.getlist(name)) > 1:
+                    return ParameterSourceConflict(name, rule, sources)
+            else:
+                raise ValueError(
+                    f"Unknown parameter source rule {rule!r} for parameter"
+                    f" {name!r}."
+                )
+
+        return None
+
     def _get_stream_for_parsing(self) -> t.IO[bytes]:
         """Access :attr:`stream`. If :meth:`get_data` has already read and
         cached the data, return a stream of the cached data instead.
@@ -659,10 +770,23 @@ class Request(_SansIORequest):
             if cache:
                 self._cached_data = data
 
+        self._check_parameter_source_contract()
+
         if as_text:
             return data.decode(errors="replace")
 
         return data
+
+    @cached_property
+    def args(self) -> ImmutableMultiDict[str, str]:
+        """The parsed URL query parameters. See
+        :class:`werkzeug.sansio.request.Request` for the full documentation.
+
+        Accessing this checks :attr:`parameter_source_contract` if one is
+        configured.
+        """
+        self._check_parameter_source_contract()
+        return super().args
 
     @cached_property
     def form(self) -> ImmutableMultiDict[str, str]:
@@ -672,6 +796,7 @@ class Request(_SansIORequest):
         .. versionchanged:: 0.9
             Works for any method, not only ``POST`` and ``PUT``.
         """
+        self._check_parameter_source_contract()
         self._load_form_data()
         return self.form
 
@@ -685,6 +810,7 @@ class Request(_SansIORequest):
         .. versionchanged:: 2.0
             For GET requests, only ``args`` are present, not ``form``.
         """
+        self._check_parameter_source_contract()
         sources = [self.args]
 
         if self.method != "GET":
@@ -718,6 +844,7 @@ class Request(_SansIORequest):
         :meth:`~.FileStorage.save` method can be used to save the data, along
         with the :func:`.secure_filename` function.
         """
+        self._check_parameter_source_contract()
         self._load_form_data()
         return self.files
 

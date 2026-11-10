@@ -111,6 +111,10 @@ Special Exceptions
 .. autoexception:: SecurityError
     :show-inheritance:
 
+.. autoexception:: ParameterSourceConflict
+    :show-inheritance:
+    :members: parameter, rule, sources
+
 
 Simple Aborting
 ---------------

@@ -286,6 +286,53 @@ class BadHost(BadRequest):
     """
 
 
+class ParameterSourceConflict(SecurityError):
+    """A parameter was sent from a source, or a number of times, that the
+    request's :attr:`~werkzeug.wrappers.Request.parameter_source_contract`
+    does not allow.
+
+    The :attr:`parameter` and :attr:`sources` attributes, and the
+    description, identify the conflicting parameter and the sources it was
+    sent in. Parameter values are never included.
+
+    .. versionadded:: 3.2
+    """
+
+    description = "A parameter was sent from a source that is not allowed."
+
+    def __init__(
+        self,
+        parameter: str,
+        rule: str,
+        sources: tuple[str, ...],
+        response: WSGIResponse | None = None,
+    ) -> None:
+        #: The decoded name of the parameter that caused the conflict.
+        self.parameter = parameter
+        #: The contract rule that was violated: ``"query"``, ``"form"``,
+        #: or ``"unique"``.
+        self.rule = rule
+        #: The sources the parameter was sent in, such as
+        #: ``("query string", "form body")``.
+        self.sources = sources
+
+        found = " and ".join(sources)
+
+        if rule == "unique":
+            description = (
+                f"The {parameter!r} parameter must be sent at most once, but"
+                f" it was sent multiple times in the {found}."
+            )
+        else:
+            expected = "query string" if rule == "query" else "form body"
+            description = (
+                f"The {parameter!r} parameter must only be sent in the"
+                f" {expected}, but it was sent in the {found}."
+            )
+
+        super().__init__(description=description, response=response)
+
+
 class Unauthorized(HTTPException):
     """
     :param www_authenticate: Set one or more ``WWW-Authenticate`` headers to

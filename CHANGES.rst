@@ -113,6 +113,10 @@ Version 3.2.0
 -   The ``Request`` ``populate_request`` parameter is deprecated. Once it's
     removed, ``environ["werkzeug.request"]`` will no longer be set.
     :issue:`3297`
+-   Added ``Request.parameter_source_contract`` to declare which source
+    (query string, form body, or at most once) named parameters may be sent
+    in. Violations raise ``ParameterSourceConflict``, a 400 error, regardless
+    of the order request attributes are accessed in.
 -   ``responder`` is deprecated. Use ``Request.application`` instead.
     :issue:`3302`
 -   ``FileWrapper`` and ``wrap_file`` are deprecated. Use ``Request.wrap_file``
