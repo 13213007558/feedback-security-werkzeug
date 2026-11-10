@@ -1,0 +1,439 @@
+[
+  {
+    "label": "baseline public",
+    "raw_request_target": "/public/hello",
+    "script_name_wire": "-",
+    "note": "ordinary route, allowed",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/public/hello",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/hello",
+      "routed": "public_hello {}",
+      "anon_http": "200",
+      "anon_endpoint": "public_hello",
+      "admin_http": "200",
+      "admin_endpoint": "public_hello"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/hello",
+      "routed": "public_hello {}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "baseline admin",
+    "raw_request_target": "/admin",
+    "script_name_wire": "-",
+    "note": "ordinary protected route, denied anon",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin",
+      "routed": "admin_home {}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_home",
+      "admin_http": "200",
+      "admin_endpoint": "admin_home"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin",
+      "routed": "admin_home {}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "admin sub path",
+    "raw_request_target": "/admin/users/42",
+    "script_name_wire": "-",
+    "note": "protected prefix, path rule",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin/users/42",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users/42",
+      "routed": "admin_sub {'sub': 'users/42'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users/42",
+      "routed": "admin_sub {'sub': 'users/42'}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "encoded first letter",
+    "raw_request_target": "/%61dmin/users",
+    "script_name_wire": "-",
+    "note": "%61 == 'a' after one decode",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/%61dmin/users",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "encoded slash inside",
+    "raw_request_target": "/admin%2fusers",
+    "script_name_wire": "-",
+    "note": "%2f -> '/' inside PATH_INFO",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin%2fusers",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "double encoded slash",
+    "raw_request_target": "/admin%252fusers",
+    "script_name_wire": "-",
+    "note": "%25 -> %, slash stays literal",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin%252fusers",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin%2fusers",
+      "routed": "404",
+      "anon_http": "404",
+      "anon_endpoint": null,
+      "admin_http": "404",
+      "admin_endpoint": null
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin%2fusers",
+      "routed": "404"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "double encoded letter",
+    "raw_request_target": "/%2561dmin",
+    "script_name_wire": "-",
+    "note": "gateway AND router see %61dmin",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/%2561dmin",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/%61dmin",
+      "routed": "404",
+      "anon_http": "404",
+      "anon_endpoint": null,
+      "admin_http": "404",
+      "admin_endpoint": null
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/%61dmin",
+      "routed": "404"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "leading double slash",
+    "raw_request_target": "//admin/users",
+    "script_name_wire": "-",
+    "note": "urlsplit netloc repair differs",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "//admin/users",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/users",
+      "routed": "404"
+    },
+    "environ_diverges": true
+  },
+  {
+    "label": "inner double slash",
+    "raw_request_target": "/admin//users",
+    "script_name_wire": "-",
+    "note": "merge_slashes redirect",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin//users",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin//users",
+      "routed": "308 -> http://localhost/admin/users",
+      "anon_http": "308",
+      "anon_endpoint": null,
+      "admin_http": "308",
+      "admin_endpoint": null
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin//users",
+      "routed": "308 -> http://localhost/admin/users"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "dot segment traversal",
+    "raw_request_target": "/public/../admin/users",
+    "script_name_wire": "-",
+    "note": "no dot normalization",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/public/../admin/users",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/../admin/users",
+      "routed": "404",
+      "anon_http": "404",
+      "anon_endpoint": null,
+      "admin_http": "404",
+      "admin_endpoint": null
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/../admin/users",
+      "routed": "404"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "encoded dot traversal",
+    "raw_request_target": "/public/%2e%2e/admin/users",
+    "script_name_wire": "-",
+    "note": "%2e -> '.' after decode",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/public/%2e%2e/admin/users",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/../admin/users",
+      "routed": "404",
+      "anon_http": "404",
+      "anon_endpoint": null,
+      "admin_http": "404",
+      "admin_endpoint": null
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/../admin/users",
+      "routed": "404"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "encoded dot single",
+    "raw_request_target": "/admin/%2e/users",
+    "script_name_wire": "-",
+    "note": "%2e -> '.' literal segment",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin/%2e/users",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/./users",
+      "routed": "admin_sub {'sub': './users'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/./users",
+      "routed": "admin_sub {'sub': './users'}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "path converter catch",
+    "raw_request_target": "/files/etc/passwd",
+    "script_name_wire": "-",
+    "note": "path rule absorbs slashes",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/files/etc/passwd",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/files/etc/passwd",
+      "routed": "files {'filename': 'etc/passwd'}",
+      "anon_http": "200",
+      "anon_endpoint": "files",
+      "admin_http": "200",
+      "admin_endpoint": "files"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/files/etc/passwd",
+      "routed": "files {'filename': 'etc/passwd'}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "encoded slash to path rule",
+    "raw_request_target": "/files/a%2fb",
+    "script_name_wire": "-",
+    "note": "one decode splits the segment",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/files/a%2fb",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/files/a/b",
+      "routed": "files {'filename': 'a/b'}",
+      "anon_http": "200",
+      "anon_endpoint": "files",
+      "admin_http": "200",
+      "admin_endpoint": "files"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/files/a/b",
+      "routed": "files {'filename': 'a/b'}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "mounted app admin",
+    "raw_request_target": "/app/admin/users",
+    "script_name_wire": "/app",
+    "note": "SCRIPT_NAME strips the mount prefix",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/app/admin/users",
+      "SCRIPT_NAME": "/app",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "/app",
+      "PATH_INFO": "/app/admin/users",
+      "routed": "404"
+    },
+    "environ_diverges": true
+  },
+  {
+    "label": "mounted encoded admin",
+    "raw_request_target": "/app/%61dmin/users",
+    "script_name_wire": "/app",
+    "note": "decode happens before prefix strip",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/app/%61dmin/users",
+      "SCRIPT_NAME": "/app",
+      "PATH_INFO": "/admin/users",
+      "routed": "admin_sub {'sub': 'users'}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_sub",
+      "admin_http": "200",
+      "admin_endpoint": "admin_sub"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "/app",
+      "PATH_INFO": "/app/admin/users",
+      "routed": "404"
+    },
+    "environ_diverges": true
+  },
+  {
+    "label": "encoded mount prefix",
+    "raw_request_target": "/%61pp/admin",
+    "script_name_wire": "/app",
+    "note": "SCRIPT_NAME itself percent-encoded on the wire",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/%61pp/admin",
+      "SCRIPT_NAME": "/app",
+      "PATH_INFO": "/admin",
+      "routed": "admin_home {}",
+      "anon_http": "403",
+      "anon_endpoint": "admin_home",
+      "admin_http": "200",
+      "admin_endpoint": "admin_home"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "/app",
+      "PATH_INFO": "/app/admin",
+      "routed": "404"
+    },
+    "environ_diverges": true
+  },
+  {
+    "label": "query confusion",
+    "raw_request_target": "/public/hello?next=/admin",
+    "script_name_wire": "-",
+    "note": "query must not be routed",
+    "gateway_raw_prefix_allows": true,
+    "server": {
+      "REQUEST_URI": "/public/hello?next=/admin",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/hello",
+      "routed": "public_hello {}",
+      "anon_http": "200",
+      "anon_endpoint": "public_hello",
+      "admin_http": "200",
+      "admin_endpoint": "public_hello"
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/public/hello",
+      "routed": "public_hello {}"
+    },
+    "environ_diverges": false
+  },
+  {
+    "label": "trailing slash redirect",
+    "raw_request_target": "/admin/",
+    "script_name_wire": "-",
+    "note": "strict_slashes on /admin",
+    "gateway_raw_prefix_allows": false,
+    "server": {
+      "REQUEST_URI": "/admin/",
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/",
+      "routed": "404",
+      "anon_http": "404",
+      "anon_endpoint": null,
+      "admin_http": "404",
+      "admin_endpoint": null
+    },
+    "test_client": {
+      "SCRIPT_NAME": "",
+      "PATH_INFO": "/admin/",
+      "routed": "404"
+    },
+    "environ_diverges": false
+  }
+]

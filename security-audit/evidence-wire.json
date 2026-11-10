@@ -1,0 +1,112 @@
+[
+  {
+    "label": "public baseline",
+    "raw_bytes": "/public/hello",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/public/hello",
+    "routed": "public_hello {}",
+    "anon_http": "200",
+    "admin_http": "200",
+    "anon_endpoint": "public_hello"
+  },
+  {
+    "label": "admin baseline",
+    "raw_bytes": "/admin",
+    "gateway_raw_prefix_allows": false,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/admin",
+    "routed": "admin_home {}",
+    "anon_http": "403",
+    "admin_http": "200",
+    "anon_endpoint": "admin_home"
+  },
+  {
+    "label": "encoded letter %61",
+    "raw_bytes": "/%61dmin/users",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/admin/users",
+    "routed": "admin_sub {'sub': 'users'}",
+    "anon_http": "403",
+    "admin_http": "200",
+    "anon_endpoint": "admin_sub"
+  },
+  {
+    "label": "encoded slash %2f",
+    "raw_bytes": "/admin%2fusers",
+    "gateway_raw_prefix_allows": false,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/admin/users",
+    "routed": "admin_sub {'sub': 'users'}",
+    "anon_http": "403",
+    "admin_http": "200",
+    "anon_endpoint": "admin_sub"
+  },
+  {
+    "label": "double-encoded slash",
+    "raw_bytes": "/admin%252fusers",
+    "gateway_raw_prefix_allows": false,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/admin%2fusers",
+    "routed": "404",
+    "anon_http": "404",
+    "admin_http": "404",
+    "anon_endpoint": null
+  },
+  {
+    "label": "leading double slash",
+    "raw_bytes": "//admin/users",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "//admin/users",
+    "routed": "admin_sub {'sub': 'users'}",
+    "anon_http": "403",
+    "admin_http": "200",
+    "anon_endpoint": "admin_sub"
+  },
+  {
+    "label": "dot traversal",
+    "raw_bytes": "/public/../admin/users",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/public/../admin/users",
+    "routed": "404",
+    "anon_http": "404",
+    "admin_http": "404",
+    "anon_endpoint": null
+  },
+  {
+    "label": "encoded dot traversal",
+    "raw_bytes": "/public/%2e%2e/admin/users",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/public/../admin/users",
+    "routed": "404",
+    "anon_http": "404",
+    "admin_http": "404",
+    "anon_endpoint": null
+  },
+  {
+    "label": "path converter encoded slash",
+    "raw_bytes": "/files/a%2fb",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "",
+    "PATH_INFO": "/files/a/b",
+    "routed": "files {'filename': 'a/b'}",
+    "anon_http": "200",
+    "admin_http": "200",
+    "anon_endpoint": "files"
+  },
+  {
+    "label": "mounted encoded letter",
+    "raw_bytes": "/app/%61dmin/users",
+    "gateway_raw_prefix_allows": true,
+    "SCRIPT_NAME": "/app",
+    "PATH_INFO": "/admin/users",
+    "routed": "admin_sub {'sub': 'users'}",
+    "anon_http": "403",
+    "admin_http": "200",
+    "anon_endpoint": "admin_sub"
+  }
+]
