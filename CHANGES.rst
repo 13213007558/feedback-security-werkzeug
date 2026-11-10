@@ -303,6 +303,10 @@ Version 3.2.0
     previously only on ``TestResponse``. :pr:`3341`
 -   The test client always writes form data to ``BytesIO`` instead of a
     temporary file.
+-   ``ProxyMiddleware`` applies chunked transfer encoding when proxying a
+    request body that the WSGI server de-chunked
+    (``wsgi.input_terminated``), so the target can determine the end of the
+    body. The connection to the target is closed if sending the body fails.
 
 
 Version 3.1.9

@@ -124,6 +124,20 @@ class ProxyMiddleware:
                 headers["Host"] = opts["host"]
 
             headers.extend(opts["headers"])
+
+            if (
+                "Content-Length" not in headers
+                and "Transfer-Encoding" not in headers
+                and request.environ.get("wsgi.input_terminated")
+            ):
+                # The WSGI server de-chunked the request body and
+                # terminates the stream, so there is no Content-Length to
+                # forward. Re-apply chunked framing, otherwise the target
+                # cannot determine where the body ends.
+                headers["Transfer-Encoding"] = "chunked"
+
+            chunked = "Transfer-Encoding" in headers
+
             remote_path = path
 
             if opts["remove_prefix"]:
@@ -163,8 +177,21 @@ class ProxyMiddleware:
 
                 con.endheaders()
 
-                while data := request.stream.read(self.chunk_size):
-                    con.send(data)
+                try:
+                    while data := request.stream.read(self.chunk_size):
+                        if chunked:
+                            con.send(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                        else:
+                            con.send(data)
+
+                    if chunked:
+                        con.send(b"0\r\n\r\n")
+                except Exception:
+                    # The body was not sent completely, the connection is
+                    # in an unknown state. It must be closed rather than
+                    # used to read a response.
+                    con.close()
+                    raise
 
                 resp = con.getresponse()
             except OSError as e:
