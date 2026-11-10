@@ -22,6 +22,14 @@ If a header has invalid syntax, it is ignored. That is, it will be as if
 ``ProxyFix`` wasn't set for that header, so you'll see the original incorrect
 but trusted value from the closest proxy.
 
+When the same application is reachable both through a reverse proxy and
+through a direct internal entry point, forwarded headers on direct
+connections can be faked by the client. Passing ``trusted_proxies`` limits
+which connecting peers are allowed to provide ``X-Forwarded-`` headers. The
+check is based solely on the unmodified ``REMOTE_ADDR`` of the direct
+connection, never on ``X-Forwarded-For``, so a client cannot vouch for
+itself.
+
 .. autoclass:: ProxyFix
 
 :copyright: 2007 Pallets
@@ -30,6 +38,7 @@ but trusted value from the closest proxy.
 
 from __future__ import annotations
 
+import ipaddress
 import typing as t
 import wsgiref.types as wt
 
@@ -61,12 +70,26 @@ class ProxyFix:
     :param x_port: Number of values to trust for ``X-Forwarded-Port``.
     :param x_prefix: Number of values to trust for
         ``X-Forwarded-Prefix``.
+    :param trusted_proxies: Configure which direct peers are trusted to
+        set ``X-Forwarded-`` headers. Each item is an IPv4 or IPv6
+        address (``"10.0.1.1"``) or network (``"10.0.0.0/8"``,
+        ``"fd00::/8"``). ``ipaddress`` objects may be passed as well.
+        When given, forwarded headers are applied only if the unmodified
+        ``REMOTE_ADDR`` matches one of these entries; otherwise all
+        forwarded headers are ignored for that request. When not given,
+        every connection is treated as a proxy as in previous versions.
+        An invalid entry raises ``ValueError`` while constructing the
+        middleware, before any request is handled.
 
     .. code-block:: python
 
         from werkzeug.middleware.proxy_fix import ProxyFix
         # App is behind one proxy that sets the -For and -Host headers.
         app = ProxyFix(app, x_for=1, x_host=1)
+
+    .. versionadded:: 3.2
+        The ``trusted_proxies`` parameter restricts which direct peers may
+        provide ``X-Forwarded-`` headers based on their ``REMOTE_ADDR``.
 
     .. versionchanged:: 3.2
         ``SERVER_NAME`` and ``SERVER_PORT`` are not modified.
@@ -96,6 +119,8 @@ class ProxyFix:
         x_host: int = 0,
         x_port: int = 0,
         x_prefix: int = 0,
+        trusted_proxies: t.Iterable[str | ipaddress.IPv4Network | ipaddress.IPv6Network]
+        | None = None,
     ) -> None:
         self.app = app
         self.x_for = x_for
@@ -103,6 +128,47 @@ class ProxyFix:
         self.x_host = x_host
         self.x_port = x_port
         self.x_prefix = x_prefix
+
+        # Parse once at construction so a bad configuration fails before the
+        # application starts serving requests instead of on the first request.
+        self.trusted_proxies: tuple[
+            ipaddress.IPv4Network | ipaddress.IPv6Network, ...
+        ] = (
+            tuple(ipaddress.ip_network(item) for item in trusted_proxies)
+            if trusted_proxies is not None
+            else ()
+        )
+
+    def _is_trusted(self, environ: wt.WSGIEnvironment) -> bool:
+        """Whether the direct peer of this request may provide forwarded
+        headers. Only the original ``REMOTE_ADDR`` is used; the
+        ``X-Forwarded-For`` header is never considered.
+
+        A missing, malformed, or IPv4-mapped address is never trusted, and a
+        network is only matched against an address of the same IP version.
+        """
+        if not self.trusted_proxies:
+            return True
+
+        remote_addr = environ.get("REMOTE_ADDR")
+
+        if not remote_addr:
+            return False
+
+        try:
+            address = ipaddress.ip_address(remote_addr)
+        except ValueError:
+            return False
+
+        # Never treat an IPv4 address embedded in IPv6 form as its IPv4
+        # counterpart; such ambiguity must be resolved explicitly.
+        if getattr(address, "ipv4_mapped", None) is not None:
+            return False
+
+        return any(
+            address.version == network.version and address in network
+            for network in self.trusted_proxies
+        )
 
     def _get_real_value(self, trusted: int, value: str | None) -> str | None:
         """Get the real value from a list header based on the configured
@@ -143,6 +209,12 @@ class ProxyFix:
                 }
             }
         )
+
+        # A direct, untrusted peer may have sent forged forwarded headers;
+        # ignore the whole set for this request. Each header still uses its
+        # own configured hop count below.
+        if not self._is_trusted(environ):
+            return self.app(environ, start_response)
 
         if x_for := self._get_real_value(
             self.x_for, environ_get("HTTP_X_FORWARDED_FOR")

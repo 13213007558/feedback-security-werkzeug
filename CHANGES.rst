@@ -267,6 +267,11 @@ Version 3.2.0
     deprecated. :issue:`3290`
 -   ``ProxyFix`` does not modify ``SERVER_NAME`` or ``SERVER_PORT``.
     :issue:`3294`
+-   ``ProxyFix`` takes a ``trusted_proxies`` argument with IPv4 and IPv6
+    addresses and networks. Forwarded headers are only applied when the
+    unmodified ``REMOTE_ADDR`` is a trusted direct peer; untrusted,
+    malformed, IPv4-mapped, or missing addresses ignore all forwarded
+    headers. Invalid configuration raises when the middleware is created.
 -   ``Request.application`` passes type checking when decorating a method.
     :issue:`3295`
 -   Removed the ``DebuggedApplication`` ``request_key`` parameter and attribute.
