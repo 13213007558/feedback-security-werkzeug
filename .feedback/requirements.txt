@@ -1,0 +1,7 @@
+ephemeral-port-reserve==1.1.4
+iniconfig==2.3.1
+markupsafe==3.0.4
+packaging==26.3
+pluggy==1.7.0
+pygments==2.21.0
+pytest==9.2.0
