@@ -13,6 +13,7 @@ import datetime as dt
 import importlib.util
 import os
 import posixpath
+import stat
 import typing as t
 import wsgiref.types as wt
 from fnmatch import fnmatch
@@ -49,6 +50,15 @@ class SharedDataMiddleware:
         loaded filename, the file is not served.
     :param cache_timeout: Set the ``Cache-Control`` ``max-age`` directive. If
         not set, conditional caching is used, which is typically what you want.
+    :param strict: Only applies to directory exports. Open the requested file
+        relative to the stable export root without following symbolic links in
+        any path segment, so a directory entry cannot be replaced to escape the
+        root. The path check, the metadata used for caching (``ETag`` and
+        ``Last-Modified``), and the bytes sent all refer to the single file
+        descriptor produced by that open. Conditional responses are enabled.
+        This guards against entry replacement and symlinks, not against an
+        already open file being rewritten in place; an in-place modification is
+        not an immutable snapshot and may be observed.
 
     .. versionchanged:: 3.2
         The ``cache`` and ``fallback_mimetype`` parameters are deprecated and
@@ -58,6 +68,8 @@ class SharedDataMiddleware:
         conditional caching.
 
         Conditional and range requests are supported.
+
+        Added the ``strict`` parameter for race-safe directory exports.
 
     .. versionchanged:: 1.0
         The default ``fallback_mimetype`` is ``application/octet-stream``
@@ -82,12 +94,14 @@ class SharedDataMiddleware:
         cache: None = None,
         cache_timeout: int | None = None,
         fallback_mimetype: None = None,
+        strict: bool = False,
     ) -> None:
         self.app = app
         self.exports: list[tuple[str, _TLoader]] = []
         self.cache = cache
         self.cache_timeout = cache_timeout
         self.fallback_mimetype = fallback_mimetype
+        self.strict = strict
 
         if cache is not None:
             import warnings
@@ -119,7 +133,7 @@ class SharedDataMiddleware:
                 if os.path.isfile(value):
                     loader = self.get_file_loader(value)
                 else:
-                    loader = self.get_directory_loader(value)
+                    loader = self.get_directory_loader(value, strict=strict)
             else:
                 raise TypeError(f"unknown def {value!r}")
 
@@ -187,7 +201,59 @@ class SharedDataMiddleware:
 
         return loader
 
-    def get_directory_loader(self, directory: str) -> _TLoader:
+    def _strict_open(
+        self, directory: str, path: str
+    ) -> tuple[t.IO[bytes], dt.datetime, int]:
+        """Open ``path`` under the trusted ``directory`` without following a
+        symbolic link in any segment and without escaping the directory.
+
+        Every segment is opened relative to a file descriptor for the previous
+        directory, so a concurrent replacement of a directory entry (including
+        swapping in a symlink to an outside file) cannot redirect the open.
+        The returned metadata and bytes therefore describe the same open file
+        descriptor.
+
+        Only entry replacement and symlinks are covered. Rewriting the opened
+        file in place is not prevented and does not produce an immutable
+        snapshot.
+        """
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        intermediate_fds: list[int] = []
+
+        try:
+            parent_fd = directory_fd
+            parts = [part for part in path.split("/") if part]
+
+            for part in parts[:-1]:
+                next_fd = os.open(
+                    part, os.O_RDONLY | no_follow | os.O_DIRECTORY, dir_fd=parent_fd
+                )
+                intermediate_fds.append(next_fd)
+                parent_fd = next_fd
+
+            file_no = os.open(parts[-1], os.O_RDONLY | no_follow, dir_fd=parent_fd)
+        finally:
+            for fd in reversed(intermediate_fds):
+                os.close(fd)
+
+            os.close(directory_fd)
+
+        file = t.cast(t.IO[bytes], os.fdopen(file_no, "rb"))
+
+        try:
+            file_stat = os.fstat(file_no)
+
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OSError("not a regular file")
+
+            mtime = dt.datetime.fromtimestamp(file_stat.st_mtime, tz=dt.UTC)
+            return file, mtime, file_stat.st_size
+        except BaseException:
+            file.close()
+            raise
+
+    def get_directory_loader(self, directory: str, strict: bool = False) -> _TLoader:
         def loader(
             path: str | None,
         ) -> tuple[str | None, _TOpener | None]:
@@ -198,6 +264,22 @@ class SharedDataMiddleware:
                     return None, None
             else:
                 path = directory
+
+            if strict:
+                if path is None:
+                    return None, None
+
+                relative = os.path.relpath(path, directory)
+
+                if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                    return None, None
+
+                filename = os.path.basename(path)
+
+                def opener() -> tuple[t.IO[bytes], dt.datetime, int]:
+                    return self._strict_open(directory, relative)
+
+                return filename, opener
 
             if os.path.isfile(path):
                 return os.path.basename(path), self._opener(path)
@@ -231,12 +313,20 @@ class SharedDataMiddleware:
         if not self.is_allowed(filename):
             return self.app
 
-        f, mtime, size = opener()
+        try:
+            f, mtime, size = opener()
+        except (OSError, ValueError):
+            # In strict mode the entry may have been removed or replaced by a
+            # symlink between lookup and the race-safe open. An invalid name
+            # such as an embedded NUL byte fails the open as well. Treat these
+            # as a missing resource rather than an unhandled server error.
+            return self.app
+
         response = send_file(
             f,
             request.environ,
             download_name=filename,
-            conditional=bool(self.cache),
+            conditional=bool(self.cache) or self.strict,
             last_modified=mtime,
             max_age=self.cache_timeout,
         )

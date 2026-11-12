@@ -282,6 +282,13 @@ Version 3.2.0
 -   ``SharedDataMiddleware`` uses ``send_file``. ``cache_timeout`` is not set by
     default, enabling conditional caching. `` The ``cache`` and
     ``fallback_mimetype`` parameters are deprecated. :issue:`3291`
+-   ``SharedDataMiddleware`` takes a ``strict`` parameter for directory
+    exports. It opens the file relative to the export root without following
+    symbolic links in any path segment, and derives the caching metadata and
+    response bytes from the single resulting descriptor, so a directory entry
+    cannot be replaced to escape the root or mix metadata and bytes across
+    files. Package resource and single-file exports are unchanged. In-place
+    rewriting of an open file is not prevented. :issue:`3349`
 -   ``Response.set_data`` can be passed an iterable or ``None``, not only a
     string or bytes. ``Content-Length`` will be cleared for arbitrary iterables.
 -   ``Response.is_sequence`` (and therefore ``make_sequence``) accepts any
