@@ -5,10 +5,20 @@ import typing as t
 from dataclasses import dataclass
 from enum import auto
 from enum import Enum
+from urllib.parse import unquote
 
 from ..datastructures.headers import Headers
 from ..exceptions import RequestEntityTooLarge
+from ..http import _charset_value_re
+from ..http import _parameter_key_re
+from ..http import _parameter_mark_re
+from ..http import _parameter_token_value_re
 from ..http import parse_options_header
+from ..http import unquote_header_value
+
+# Charsets accepted for RFC 2231/5987 ``key*=charset''value`` parameters. This
+# mirrors the safe list used by :func:`http.parse_options_header`.
+_EXTENDED_CHARSETS = frozenset({"ascii", "us-ascii", "utf-8", "iso-8859-1"})
 
 
 class Event:
@@ -51,6 +61,314 @@ class NeedData(Event):
 NEED_DATA = NeedData()
 
 
+class PartHeaderError(ValueError):
+    """Raised in strict mode when a part's ``Content-Disposition`` header is
+    ambiguous or invalid.
+
+    The message identifies the 1-based position of the offending part and the
+    ambiguous header or parameter name. Because the error is raised while the
+    part headers are decoded, the ``stream_factory`` has not created a file for
+    the rejected part yet.
+
+    .. versionadded:: 3.2
+    """
+
+
+@dataclass(frozen=True)
+class _Disposition:
+    """Validated result of parsing a ``Content-Disposition`` header value."""
+
+    disposition: str
+    name: str | None
+    filename: str | None
+
+
+# Tracks one raw parameter occurrence while scanning a header value. ``kind``
+# is "plain", "extended" (``key*``), or "continuation" (``key*n*``).
+@dataclass
+class _RawParameter:
+    key: str
+    value: str
+    kind: str
+    number: int | None = None
+
+
+def _strict_part_header_error(part_index: int, detail: str) -> PartHeaderError:
+    return PartHeaderError(
+        f"Part {part_index} has an ambiguous Content-Disposition header: {detail}"
+    )
+
+
+def _tokenize_disposition(
+    value: str, part_index: int
+) -> tuple[str, list[_RawParameter]]:
+    """Split a ``Content-Disposition`` value into its disposition token and raw
+    parameters, enforcing the RFC 9110 grammar instead of silently skipping
+    malformed pieces.
+    """
+    head, has_semicolon, rest = value.partition(";")
+    disposition = head.strip(" \t")
+
+    if not disposition:
+        raise _strict_part_header_error(part_index, "missing disposition")
+
+    if not has_semicolon:
+        return disposition, []
+
+    parameters: list[_RawParameter] = []
+    rest = rest.lstrip(" \t")
+    scan_pos = 0
+    length = len(rest)
+
+    while scan_pos < length:
+        key_match = _parameter_key_re.match(rest, scan_pos)
+
+        if key_match is None:
+            raise _strict_part_header_error(part_index, "malformed parameter")
+
+        raw_key = key_match.group(1)
+        scan_pos = key_match.end()
+        mark_match = _parameter_mark_re.search(raw_key)
+        assert mark_match is not None
+        continuation_number = mark_match.group(1)
+        has_continuation = continuation_number is not None
+        has_charset = mark_match.group(2) is not None
+        base_key = raw_key[: mark_match.start()].lower()
+
+        if has_continuation:
+            # key*n* or key*n: an RFC 2231 continuation segment. Only the
+            # first segment is expected to carry a charset marker.
+            kind = "continuation"
+        elif has_charset:
+            kind = "extended"
+        else:
+            kind = "plain"
+
+        value_match = _parameter_token_value_re.match(rest, scan_pos)
+
+        if value_match is not None:
+            raw_value = value_match.group()
+            scan_pos = value_match.end()
+        elif rest.startswith('"', scan_pos):
+            quote_pos = scan_pos + 1
+
+            while quote_pos < length:
+                if rest.startswith(("\\\\", '\\"'), quote_pos):
+                    quote_pos += 2
+                elif rest.startswith('"', quote_pos):
+                    quote_pos += 1
+                    break
+                else:
+                    quote_pos += 1
+            else:
+                raise _strict_part_header_error(
+                    part_index, f"unclosed quoted value for parameter {base_key!r}"
+                )
+
+            raw_value = rest[scan_pos:quote_pos]
+            scan_pos = quote_pos
+        else:
+            raise _strict_part_header_error(
+                part_index, f"parameter {base_key!r} has no value"
+            )
+
+        parameters.append(
+            _RawParameter(
+                key=base_key,
+                value=raw_value,
+                kind=kind,
+                number=int(continuation_number)
+                if continuation_number is not None
+                else None,
+            )
+        )
+
+        if scan_pos >= length:
+            break
+
+        if rest[scan_pos] != ";":
+            raise _strict_part_header_error(
+                part_index, f"expected ';' after parameter {base_key!r}"
+            )
+
+        scan_pos += 1
+
+        while scan_pos < length and rest[scan_pos] in " \t":
+            scan_pos += 1
+
+    return disposition, parameters
+
+
+def _decode_extended_value(raw: str, part_index: int, key: str) -> str:
+    """Decode an RFC 2231/5987 ``charset''percent-encoded`` value.
+
+    Only the charsets accepted in compatibility mode are valid; anything else
+    is rejected rather than left quoted.
+    """
+    charset_match = _charset_value_re.match(raw)
+
+    if charset_match is None:
+        raise _strict_part_header_error(
+            part_index, f"invalid extended encoding for parameter {key!r}"
+        )
+
+    charset, encoded = charset_match.groups()
+    charset = charset.lower()
+
+    if charset not in _EXTENDED_CHARSETS:
+        raise _strict_part_header_error(
+            part_index, f"unsupported charset {charset!r} for parameter {key!r}"
+        )
+
+    return unquote(encoded, encoding=charset, errors="replace")
+
+
+def _decode_continuation_value(
+    raw: str,
+    prior_charset: str | None,
+    part_index: int,
+    key: str,
+) -> tuple[str, str]:
+    """Decode one RFC 2231 continuation segment (``key*n*`` or ``key*n=``).
+
+    The first segment carries the charset marker; later segments reuse it. A
+    later segment without a marker is decoded using the prior charset. Returns
+    the decoded value and the charset to pass to the next segment.
+    """
+    charset_match = _charset_value_re.match(raw)
+
+    if charset_match is not None:
+        charset, encoded = charset_match.groups()
+        charset = charset.lower()
+    elif prior_charset is not None:
+        charset = prior_charset
+        encoded = unquote_header_value(raw)
+    else:
+        raise _strict_part_header_error(
+            part_index,
+            f"continuation segment for parameter {key!r} is missing a charset",
+        )
+
+    if charset not in _EXTENDED_CHARSETS:
+        raise _strict_part_header_error(
+            part_index, f"unsupported charset {charset!r} for parameter {key!r}"
+        )
+
+    # Every RFC 2231 segment is percent encoded, including later segments that
+    # omit the charset marker and may be quoted.
+    return unquote(encoded, encoding=charset, errors="replace"), charset
+
+
+def _decode_plain_value(raw: str) -> str:
+    return unquote_header_value(raw).replace("%22", '"')
+
+
+def _parse_strict_disposition(value: str, part_index: int) -> _Disposition:
+    """Parse and validate a single ``Content-Disposition`` header value.
+
+    Duplicate parameters are rejected, while the canonical ``filename`` plus
+    valid ``filename*`` pairing is accepted with the extended value taking
+    precedence, matching the compatibility parser's precedence rules.
+    """
+    disposition, raw_parameters = _tokenize_disposition(value, part_index)
+
+    seen_kinds: dict[str, set[str]] = {}
+    seen_numbers: dict[str, set[int]] = {}
+
+    for parameter in raw_parameters:
+        kinds = seen_kinds.setdefault(parameter.key, set())
+
+        if parameter.kind == "continuation":
+            # RFC 2231 splits one value into ordered key*n* segments, so the
+            # key repeats legitimately; the same segment number may not.
+            assert parameter.number is not None
+            numbers = seen_numbers.setdefault(parameter.key, set())
+
+            if parameter.number in numbers:
+                raise _strict_part_header_error(
+                    part_index,
+                    f"duplicate parameter {parameter.key!r}",
+                )
+
+            numbers.add(parameter.number)
+        elif parameter.kind in kinds:
+            raise _strict_part_header_error(
+                part_index,
+                f"duplicate parameter {parameter.key!r}",
+            )
+
+        kinds.add(parameter.kind)
+
+    plain: dict[str, str] = {}
+    extended: dict[str, str] = {}
+    continuations: dict[str, list[str]] = {}
+    continuation_charsets: dict[str, str] = {}
+
+    for parameter in raw_parameters:
+        if parameter.kind == "extended":
+            extended[parameter.key] = _decode_extended_value(
+                parameter.value, part_index, parameter.key
+            )
+        elif parameter.kind == "continuation":
+            decoded_value, charset = _decode_continuation_value(
+                parameter.value,
+                continuation_charsets.get(parameter.key),
+                part_index,
+                parameter.key,
+            )
+            continuation_charsets[parameter.key] = charset
+            continuations.setdefault(parameter.key, []).append(decoded_value)
+        else:
+            plain[parameter.key] = _decode_plain_value(parameter.value)
+
+    for key in continuations:
+        # A continuation series is its own complete definition and cannot be
+        # combined with a plain or single extended value.
+        if key in plain or key in extended:
+            raise _strict_part_header_error(
+                part_index,
+                f"conflicting parameter {key!r}",
+            )
+
+    # A plain value plus a valid extended value is the canonical combination;
+    # the extended value always wins, regardless of ordering.
+    plain.update(extended)
+    plain.update({key: "".join(pieces) for key, pieces in continuations.items()})
+    decoded = plain
+
+    return _Disposition(
+        disposition=disposition.lower(),
+        name=decoded.get("name"),
+        filename=decoded.get("filename"),
+    )
+
+
+def _strict_part_headers(headers: Headers, part_index: int) -> _Disposition:
+    """Validate part headers in strict mode and return the parsed disposition.
+
+    Rejects repeated header lines (most importantly repeated
+    ``Content-Disposition``) before any file is created for the part.
+    """
+    seen: set[str] = set()
+
+    for header_name, _ in headers:
+        normalized = header_name.lower()
+
+        if normalized in seen:
+            raise _strict_part_header_error(
+                part_index, f"duplicate header {normalized!r}"
+            )
+
+        seen.add(normalized)
+
+    disposition_value = headers.get("Content-Disposition")
+
+    if disposition_value is None:
+        raise _strict_part_header_error(part_index, "missing Content-Disposition")
+
+    return _parse_strict_disposition(disposition_value, part_index)
+
+
 class State(Enum):
     PREAMBLE = auto()
     PART = auto()
@@ -90,11 +408,13 @@ class MultipartDecoder:
         max_form_memory_size: int | None = None,
         *,
         max_parts: int | None = None,
+        strict_part_headers: bool = False,
     ) -> None:
         self.buffer = bytearray()
         self.complete = False
         self.max_form_memory_size = max_form_memory_size
         self.max_parts = max_parts
+        self.strict_part_headers = strict_part_headers
         self.state = State.PREAMBLE
         self.boundary = boundary
 
@@ -166,16 +486,28 @@ class MultipartDecoder:
                 # blank line indicates the start of the
                 # body. Therefore the end is after the first CRLF.
                 headers_end = (match.start() + match.end()) // 2
+
+                # Validate before consuming the header block or creating a
+                # streaming event so that a rejected part never reaches the
+                # caller's stream factory.
+                part_index = self._parts_decoded + 1
+
+                if self.strict_part_headers:
+                    disposition = _strict_part_headers(headers, part_index)
+                    name = disposition.name
+                    filename = disposition.filename
+                else:
+                    if "Content-Disposition" not in headers:
+                        raise ValueError("Missing Content-Disposition header")
+
+                    disposition, extra = parse_options_header(
+                        headers["Content-Disposition"]
+                    )
+                    name = t.cast(str, extra.get("name"))
+                    filename = extra.get("filename")
+
                 del self.buffer[:headers_end]
 
-                if "Content-Disposition" not in headers:
-                    raise ValueError("Missing Content-Disposition header")
-
-                disposition, extra = parse_options_header(
-                    headers["Content-Disposition"]
-                )
-                name = t.cast(str, extra.get("name"))
-                filename = extra.get("filename")
                 if filename is not None:
                     event = File(
                         filename=filename,

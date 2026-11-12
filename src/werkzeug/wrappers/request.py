@@ -111,6 +111,22 @@ class Request(_SansIORequest):
     .. versionadded:: 2.2.3
     """
 
+    strict_part_headers = False
+    """Validate each part's ``Content-Disposition`` header strictly while
+    parsing ``multipart/form-data``. When enabled, ambiguous headers raise a
+    :exc:`~werkzeug.sansio.multipart.PartHeaderError` before any file is
+    created for the part: repeated header lines, repeated parameters such as
+    two ``filename`` values, and invalid extended ``filename*`` encodings are
+    rejected instead of silently choosing one value. The canonical
+    ``filename`` plus a valid ``filename*`` combination remains valid, with
+    ``filename*`` taking precedence. Repeated field names still produce
+    multi-value form data.
+
+    The default of ``False`` keeps the lenient compatibility behavior.
+
+    .. versionadded:: 3.2
+    """
+
     form_data_parser_class: None = None
     """The class to use to parse form data.
 
@@ -321,6 +337,7 @@ class Request(_SansIORequest):
             "max_form_memory_size": self.max_form_memory_size,
             "max_content_length": self.max_content_length,
             "max_form_parts": self.max_form_parts,
+            "strict_part_headers": self.strict_part_headers,
         }
 
         if type(self)._get_file_stream is not Request._get_file_stream:

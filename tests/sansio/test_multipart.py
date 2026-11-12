@@ -8,6 +8,7 @@ from werkzeug.sansio.multipart import File
 from werkzeug.sansio.multipart import MultipartDecoder
 from werkzeug.sansio.multipart import MultipartEncoder
 from werkzeug.sansio.multipart import NeedData
+from werkzeug.sansio.multipart import PartHeaderError
 from werkzeug.sansio.multipart import Preamble
 
 
@@ -180,3 +181,210 @@ Content-Type: text/plain; charset="UTF-8"
     for event in events:
         result += encoder.send_event(event)
     assert data == result
+
+
+def _feed_decoder(data: bytes, *, strict: bool, chunk_size: int) -> list:
+    """Feed ``data`` in fixed-size chunks so headers span multiple
+    ``receive_data`` calls, then collect the part events."""
+    decoder = MultipartDecoder(b"b", strict_part_headers=strict)
+
+    for index in range(0, len(data), chunk_size):
+        decoder.receive_data(data[index : index + chunk_size])
+
+    decoder.receive_data(None)
+    events = []
+
+    while True:
+        event = decoder.next_event()
+
+        if isinstance(event, Epilogue):
+            return events
+
+        if isinstance(event, (Field, File)):
+            events.append(event)
+
+
+def _part(headers: bytes, body: bytes = b"x") -> bytes:
+    return b"--b\r\n" + headers + b"\r\n\r\n" + body + b"\r\n--b--"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 64])
+def test_strict_rejects_duplicate_filename_parameter(chunk_size: int) -> None:
+    data = _part(
+        b'Content-Disposition: form-data; name="f";'
+        b' filename="a.txt"; filename="b.txt"'
+    )
+
+    # Compatibility mode silently keeps the last value, regardless of chunking.
+    compat = _feed_decoder(data, strict=False, chunk_size=chunk_size)
+    assert isinstance(compat[0], File)
+    assert compat[0].filename == "b.txt"
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=chunk_size)
+
+    message = str(exc_info.value)
+    assert "Part 1" in message
+    assert "filename" in message
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 64])
+def test_strict_rejects_duplicate_disposition_header(chunk_size: int) -> None:
+    data = _part(
+        b'Content-Disposition: form-data; name="f"; filename="a.txt"\r\n'
+        b'Content-Disposition: form-data; name="f"; filename="b.txt"'
+    )
+
+    # Compatibility only inspects the first header of a repeated name.
+    compat = _feed_decoder(data, strict=False, chunk_size=chunk_size)
+    assert compat[0].filename == "a.txt"
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=chunk_size)
+
+    message = str(exc_info.value)
+    assert "Part 1" in message
+    assert "content-disposition" in message
+
+
+def test_strict_rejects_duplicate_name_parameter() -> None:
+    data = _part(b'Content-Disposition: form-data; name="a"; name="b"')
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=1)
+
+    message = str(exc_info.value)
+    assert "Part 1" in message
+    assert "name" in message
+
+
+def test_strict_rejects_invalid_extended_encoding() -> None:
+    data = _part(b"Content-Disposition: form-data; name=f; filename*=bogus''x.txt")
+
+    # Compatibility leaves the unsupported value quoted rather than failing.
+    compat = _feed_decoder(data, strict=False, chunk_size=1)
+    assert compat[0].filename == "x.txt"
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=1)
+
+    message = str(exc_info.value)
+    assert "Part 1" in message
+    assert "filename" in message
+
+
+def test_strict_rejects_malformed_extended_value() -> None:
+    data = _part(b"Content-Disposition: form-data; name=f; filename*=not-encoded")
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=2)
+
+    message = str(exc_info.value)
+    assert "Part 1" in message
+    assert "filename" in message
+
+
+def test_strict_accepts_canonical_filename_and_extended() -> None:
+    data = _part(
+        b'Content-Disposition: form-data; name="f"; filename="ascii.txt";'
+        b" filename*=utf-8''%E2%9C%93.txt"
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=1)
+    assert len(events) == 1
+    assert isinstance(events[0], File)
+    assert events[0].name == "f"
+    assert events[0].filename == "✓.txt"
+
+
+def test_strict_extended_wins_regardless_of_order() -> None:
+    data = _part(
+        b"Content-Disposition: form-data; name=f;"
+        b" filename*=utf-8''%E2%9C%93.txt; filename=\"ascii.txt\""
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=4)
+    assert events[0].filename == "✓.txt"
+
+
+def test_strict_accepts_unicode_extended_filename() -> None:
+    data = _part(
+        b"Content-Disposition: form-data; name=f;"
+        b" filename*=utf-8''%E6%96%87%E4%BB%B6.txt"
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=1)
+    assert events[0].filename == "文件.txt"
+
+
+def test_strict_accepts_empty_filename() -> None:
+    data = _part(b'Content-Disposition: form-data; name="f"; filename=""')
+    events = _feed_decoder(data, strict=True, chunk_size=1)
+    assert isinstance(events[0], File)
+    assert events[0].filename == ""
+
+
+def test_strict_accepts_semicolon_inside_quoted_value() -> None:
+    data = _part(
+        b'Content-Disposition: form-data; name="f";'
+        b' filename="report; final.txt"'
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=2)
+    assert events[0].filename == "report; final.txt"
+
+
+def test_strict_accepts_escaped_quote_in_filename() -> None:
+    data = _part(
+        b'Content-Disposition: form-data; name="f";'
+        b' filename="a\\"b.txt"'
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=1)
+    assert events[0].filename == 'a"b.txt'
+
+
+def test_strict_allows_repeated_field_names_across_parts() -> None:
+    data = (
+        b'--b\r\nContent-Disposition: form-data; name="n"\r\n\r\nv1\r\n'
+        b'--b\r\nContent-Disposition: form-data; name="n"\r\n\r\nv2\r\n--b--'
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=3)
+    assert [event.name for event in events] == ["n", "n"]
+
+
+def test_strict_reports_second_part_index() -> None:
+    data = (
+        b'--b\r\nContent-Disposition: form-data; name="ok"\r\n\r\nv1\r\n'
+        b"--b\r\n"
+        b'Content-Disposition: form-data; name="bad";'
+        b' filename="a"; filename="b"\r\n\r\nv2\r\n--b--'
+    )
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=1)
+
+    message = str(exc_info.value)
+    assert "Part 2" in message
+    assert "filename" in message
+
+
+def test_strict_accepts_rfc2231_continuation() -> None:
+    data = _part(
+        b"Content-Disposition: form-data; name=rfc2231;\r\n"
+        b"\tfilename*0*=ascii''a%20b%20;\r\n"
+        b"\tfilename*1*=c%20d%20;\r\n"
+        b'\tfilename*2="e f.txt"'
+    )
+    events = _feed_decoder(data, strict=True, chunk_size=2)
+    assert events[0].filename == "a b c d e f.txt"
+
+
+def test_strict_rejects_duplicate_continuation_segment() -> None:
+    data = _part(
+        b"Content-Disposition: form-data; name=n;\r\n"
+        b"\tfilename*0*=ascii''a;\r\n"
+        b"\tfilename*0*=ascii''b"
+    )
+
+    with pytest.raises(PartHeaderError) as exc_info:
+        _feed_decoder(data, strict=True, chunk_size=1)
+
+    message = str(exc_info.value)
+    assert "Part 1" in message
+    assert "filename" in message

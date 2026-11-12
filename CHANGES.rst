@@ -303,6 +303,15 @@ Version 3.2.0
     previously only on ``TestResponse``. :pr:`3341`
 -   The test client always writes form data to ``BytesIO`` instead of a
     temporary file.
+-   Add an opt-in strict mode for ``multipart/form-data`` part headers via the
+    ``Request.strict_part_headers`` attribute and the ``strict_part_headers``
+    parameter to the form and multipart parsers. It rejects repeated header
+    lines, repeated ``Content-Disposition`` parameters, invalid extended
+    ``filename*`` encodings, and conflicting parameter definitions with
+    ``PartHeaderError`` before a rejected part's file is created. The canonical
+    ``filename`` plus a valid ``filename*`` remains valid, and repeated field
+    names still produce multi-value form data. The lenient default behavior is
+    unchanged.
 
 
 Version 3.1.9

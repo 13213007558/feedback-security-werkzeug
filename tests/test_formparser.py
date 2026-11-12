@@ -6,6 +6,7 @@ import pytest
 
 from werkzeug import formparser
 from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.sansio.multipart import PartHeaderError
 from werkzeug.test import Client
 from werkzeug.wrappers import Request
 from werkzeug.wrappers import Response
@@ -414,3 +415,227 @@ def test_multipart_max_form_memory_size() -> None:
 
     with pytest.raises(RequestEntityTooLarge):
         parser.parse(io.BytesIO(data), b"bound", None)
+
+
+class TestStrictPartHeaders:
+    def _body(self, parts: list[bytes]) -> bytes:
+        return b"--b\r\n" + b"\r\n--b\r\n".join(parts) + b"\r\n--b--"
+
+    def _counting_factory(self, calls: list[str | None]):
+        def factory(total_content_length, content_type, filename, content_length=None):
+            calls.append(filename)
+            return io.BytesIO()
+
+        return factory
+
+    def test_rejected_part_never_creates_file(self) -> None:
+        calls: list[str | None] = []
+        good = (
+            b'Content-Disposition: form-data; name="ok"; filename="ok.txt"\r\n\r\n'
+            b"good"
+        )
+        bad = (
+            b'Content-Disposition: form-data; name="bad";'
+            b' filename="a"; filename="b"\r\n\r\nevil'
+        )
+        data = self._body([good, bad])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+        )
+
+        with pytest.raises(PartHeaderError) as exc_info:
+            parser.parse(io.BytesIO(data), b"b", None)
+
+        message = str(exc_info.value)
+        assert "Part 2" in message
+        assert "filename" in message
+        # Only the valid first part reached the stream factory.
+        assert calls == ["ok.txt"]
+
+    def test_compat_mode_still_parses_both_parts(self) -> None:
+        calls: list[str | None] = []
+        good = (
+            b'Content-Disposition: form-data; name="ok"; filename="ok.txt"\r\n\r\n'
+            b"good"
+        )
+        ambiguous = (
+            b'Content-Disposition: form-data; name="dup";'
+            b' filename="a"; filename="b"\r\n\r\nevil'
+        )
+        data = self._body([good, ambiguous])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+        )
+
+        _, files = parser.parse(io.BytesIO(data), b"b", None)
+
+        assert calls == ["ok.txt", "b"]
+        assert files["dup"].filename == "b"
+
+    def test_duplicate_disposition_header_rejected_before_file(self) -> None:
+        calls: list[str | None] = []
+        bad = (
+            b'Content-Disposition: form-data; name="f"; filename="a"\r\n'
+            b'Content-Disposition: form-data; name="f"; filename="b"\r\n\r\nx'
+        )
+        data = self._body([bad])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+        )
+
+        with pytest.raises(PartHeaderError) as exc_info:
+            parser.parse(io.BytesIO(data), b"b", None)
+
+        assert "Part 1" in str(exc_info.value)
+        assert "content-disposition" in str(exc_info.value)
+        assert calls == []
+
+    def test_repeated_field_names_still_form_multivalue(self) -> None:
+        calls: list[str | None] = []
+        first = b'Content-Disposition: form-data; name="n"\r\n\r\nv1'
+        second = b'Content-Disposition: form-data; name="n"\r\n\r\nv2'
+        data = self._body([first, second])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+        )
+
+        form, files = parser.parse(io.BytesIO(data), b"b", None)
+
+        assert form.getlist("n") == ["v1", "v2"]
+        assert files.getlist("n") == []
+        assert calls == []
+
+    def test_repeated_file_names_still_allowed(self) -> None:
+        calls: list[str | None] = []
+        first = (
+            b'Content-Disposition: form-data; name="up"; filename="a.txt"\r\n\r\n'
+            b"one"
+        )
+        second = (
+            b'Content-Disposition: form-data; name="up"; filename="a.txt"\r\n\r\n'
+            b"two"
+        )
+        data = self._body([first, second])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+        )
+
+        _, files = parser.parse(io.BytesIO(data), b"b", None)
+
+        assert len(files.getlist("up")) == 2
+        assert calls == ["a.txt", "a.txt"]
+
+    def test_valid_canonical_filename_star_accepted(self) -> None:
+        calls: list[str | None] = []
+        part = (
+            b'Content-Disposition: form-data; name="up"; filename="ascii.txt";'
+            b" filename*=utf-8''%E2%9C%93.txt\r\n\r\nx"
+        )
+        data = self._body([part])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+        )
+
+        _, files = parser.parse(io.BytesIO(data), b"b", None)
+
+        assert files["up"].filename == "✓.txt"
+        assert calls == ["✓.txt"]
+
+    def test_invalid_extended_encoding_rejected_before_file(self) -> None:
+        calls: list[str | None] = []
+        part = (
+            b"Content-Disposition: form-data; name=up;"
+            b" filename*=bogus''x.txt\r\n\r\nx"
+        )
+        data = self._body([part])
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+        )
+
+        with pytest.raises(PartHeaderError):
+            parser.parse(io.BytesIO(data), b"b", None)
+
+        assert calls == []
+
+    def test_headers_split_across_chunks_still_rejected(self) -> None:
+        calls: list[str | None] = []
+        part = (
+            b'Content-Disposition: form-data; name="bad";'
+            b' filename="a"; filename="b"\r\n\r\nx'
+        )
+        data = self._body([part])
+
+        class OneByteStream:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+                self._pos = 0
+
+            def read(self, size: int = -1) -> bytes:
+                if self._pos >= len(self._payload):
+                    return b""
+
+                chunk = self._payload[self._pos : self._pos + 1]
+                self._pos += 1
+                return chunk
+
+        parser = formparser.MultiPartParser(
+            stream_factory=self._counting_factory(calls),
+            strict_part_headers=True,
+            buffer_size=1,
+        )
+
+        with pytest.raises(PartHeaderError) as exc_info:
+            parser.parse(OneByteStream(data), b"b", None)
+
+        assert "Part 1" in str(exc_info.value)
+        assert calls == []
+
+
+class StrictRequest(Request):
+    strict_part_headers = True
+
+
+def test_request_strict_part_headers_attribute_opt_in() -> None:
+    ambiguous = (
+        b"--b\r\n"
+        b'Content-Disposition: form-data; name="f";'
+        b' filename="a"; filename="b"\r\n\r\nx\r\n--b--'
+    )
+
+    # Default Request keeps compatibility behavior.
+    with Request.from_values(
+        data=ambiguous,
+        content_type="multipart/form-data; boundary=b",
+        method="POST",
+    ) as default_request:
+        assert default_request.files["f"].filename == "b"
+
+    # Strict Request silently returns empty form data by default.
+    with StrictRequest.from_values(
+        data=ambiguous,
+        content_type="multipart/form-data; boundary=b",
+        method="POST",
+    ) as strict_request:
+        assert not strict_request.form
+        assert not strict_request.files
+
+
+def test_request_strict_mode_accepts_valid_upload() -> None:
+    body = (
+        b"--b\r\n"
+        b'Content-Disposition: form-data; name="up"; filename="ok.txt"\r\n\r\n'
+        b"contents\r\n--b--"
+    )
+    with StrictRequest.from_values(
+        data=body,
+        content_type="multipart/form-data; boundary=b",
+        method="POST",
+    ) as request:
+        assert request.files["up"].filename == "ok.txt"
+        assert request.files["up"].read() == b"contents"

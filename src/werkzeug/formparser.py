@@ -62,6 +62,7 @@ def _parse_form_data(
     silent: bool = True,
     *,
     max_form_parts: int | None = None,
+    strict_part_headers: bool = False,
     **kwargs: t.Any,
 ) -> t_parse_result:
     """Parse the form data from the request body and return it as a
@@ -127,6 +128,7 @@ def _parse_form_data(
         max_content_length=max_content_length,
         max_form_parts=max_form_parts,
         silent=silent,
+        strict_part_headers=strict_part_headers,
     )
 
     if "cls" in kwargs:
@@ -199,12 +201,14 @@ class _FormDataParser:
         silent: bool = True,
         *,
         max_form_parts: int | None = None,
+        strict_part_headers: bool = False,
         **kwargs: t.Any,
     ) -> None:
         self.stream_factory = stream_factory
         self.max_content_length = max_content_length
         self.max_form_memory_size = max_form_memory_size
         self.max_form_parts = max_form_parts
+        self.strict_part_headers = strict_part_headers
 
         if "cls" in kwargs:
             import warnings
@@ -299,6 +303,7 @@ class _FormDataParser:
             stream_factory=self.stream_factory,
             max_form_memory_size=self.max_form_memory_size,
             max_form_parts=self.max_form_parts,
+            strict_part_headers=self.strict_part_headers,
         )
 
         if self.cls is not None:
@@ -341,10 +346,12 @@ class MultiPartParser:
         max_form_memory_size: int | None = None,
         buffer_size: int = 64 * 1024,
         max_form_parts: int | None = None,
+        strict_part_headers: bool = False,
         **kwargs: t.Any,
     ) -> None:
         self.max_form_memory_size = max_form_memory_size
         self.max_form_parts = max_form_parts
+        self.strict_part_headers = strict_part_headers
 
         if stream_factory is None:
             stream_factory = _make_stream_factory(max_form_memory_size)
@@ -424,6 +431,7 @@ class MultiPartParser:
             boundary,
             max_form_memory_size=self.max_form_memory_size,
             max_parts=self.max_form_parts,
+            strict_part_headers=self.strict_part_headers,
         )
 
         fields = []
